@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { z } from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -18,8 +18,17 @@ const schema = z.object({
 });
 type Values = z.infer<typeof schema>;
 
+/** Whitelist the `?next=` target to prevent open-redirects. */
+function safeNext(raw: string | null): string {
+  if (!raw) return "/dashboard";
+  if (!raw.startsWith("/")) return "/dashboard";
+  if (raw.startsWith("//")) return "/dashboard";
+  return raw;
+}
+
 export function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const setAuth = useAuthStore((s) => s.setAuth);
   const [submitting, setSubmitting] = useState(false);
 
@@ -62,7 +71,7 @@ export function LoginForm() {
         accessTokenTtlSec: body.accessTokenTtlSec,
       });
       toast.success("Signed in");
-      router.replace("/dashboard");
+      router.replace(safeNext(searchParams.get("next")));
     } catch {
       toast.error("Network error. Try again.");
     } finally {

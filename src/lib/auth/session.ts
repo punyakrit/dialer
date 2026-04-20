@@ -10,7 +10,9 @@ import {
 import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export const REFRESH_COOKIE = "dialer_refresh";
-export const REFRESH_COOKIE_PATH = "/api/auth";
+// Path is `/` so the Edge proxy (`src/proxy.ts`) can read it for page-level
+// redirects. Cookie stays httpOnly + Secure + SameSite=Lax so JS can't see it.
+export const REFRESH_COOKIE_PATH = "/";
 
 type IssueInput = AccessTokenPayload & {
   userAgent?: string | null;

@@ -115,9 +115,28 @@ export function Softphone() {
               {active ? "Calling" : buffer ? "To" : "Enter a number"}
             </div>
             <div className="flex items-center justify-between gap-2">
-              <div className="truncate font-mono text-2xl tabular-nums">
-                {active ? active.to : buffer || "—"}
-              </div>
+              <input
+                type="tel"
+                inputMode="tel"
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
+                value={active ? active.to : buffer}
+                placeholder="—"
+                readOnly={!!active}
+                aria-label="Phone number"
+                onChange={(e) =>
+                  useDialerStore.getState().set(sanitizePhoneInput(e.target.value))
+                }
+                onPaste={(e) => {
+                  e.preventDefault();
+                  const text = e.clipboardData.getData("text");
+                  useDialerStore
+                    .getState()
+                    .set(sanitizePhoneInput(text));
+                }}
+                className="min-w-0 flex-1 border-0 bg-transparent p-0 font-mono text-2xl tabular-nums text-foreground outline-none placeholder:text-muted-foreground/40 focus:outline-none focus:ring-0"
+              />
               {!active && buffer ? (
                 <Button
                   type="button"
@@ -125,7 +144,7 @@ export function Softphone() {
                   variant="ghost"
                   aria-label="Backspace"
                   onClick={backspace}
-                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                  className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
                 >
                   <Delete className="h-4 w-4" />
                 </Button>
@@ -215,4 +234,19 @@ export function Softphone() {
       </div>
     </div>
   );
+}
+
+/**
+ * Strip formatting noise from typed or pasted phone input, keeping only
+ * digits / `*` / `#` and at most one leading `+`. Lets a user paste e.g.
+ * `+1 (415) 555-0123` or `+1-415-555-0123 x.123` and end up with a valid
+ * E.164-ish `+14155550123`.
+ */
+function sanitizePhoneInput(raw: string): string {
+  const cleaned = raw.replace(/[^0-9+*#]/g, "");
+  // Preserve at most one `+`, only at position 0.
+  if (cleaned.startsWith("+")) {
+    return "+" + cleaned.slice(1).replace(/\+/g, "");
+  }
+  return cleaned.replace(/\+/g, "");
 }

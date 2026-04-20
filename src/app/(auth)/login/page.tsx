@@ -1,3 +1,4 @@
+import { Suspense } from "react";
 import { LoginForm } from "@/components/auth/LoginForm";
 import {
   Card,
@@ -6,6 +7,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import Link from "next/link";
 
 export const metadata = { title: "Sign in" };
@@ -20,7 +22,9 @@ export default function LoginPage() {
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <LoginForm />
+        <Suspense fallback={<LoginFormSkeleton />}>
+          <LoginForm />
+        </Suspense>
         <p className="mt-6 text-center text-sm text-muted-foreground">
           New here?{" "}
           <Link href="/register" className="font-medium text-foreground">
@@ -29,5 +33,15 @@ export default function LoginPage() {
         </p>
       </CardContent>
     </Card>
+  );
+}
+
+function LoginFormSkeleton() {
+  return (
+    <div className="space-y-4">
+      <Skeleton className="h-9 w-full" />
+      <Skeleton className="h-9 w-full" />
+      <Skeleton className="h-9 w-full" />
+    </div>
   );
 }
