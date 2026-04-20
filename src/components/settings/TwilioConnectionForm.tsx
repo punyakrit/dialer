@@ -1,22 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { toast } from "sonner";
-import { CheckCircle2, Loader2, ShieldCheck, Wifi, XCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  Loader2,
+  Plug,
+  ShieldCheck,
+  Wifi,
+  XCircle,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Card,
   CardContent,
@@ -25,58 +24,39 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Skeleton } from "@/components/ui/skeleton";
 import { authFetch } from "@/lib/auth/client";
-
-const EDGE_OPTIONS = [
-  { value: "singapore", label: "Singapore (recommended for India → US)" },
-  { value: "tokyo", label: "Tokyo" },
-  { value: "sydney", label: "Sydney" },
-  { value: "ashburn", label: "Ashburn (US East)" },
-  { value: "umatilla", label: "Umatilla (US West)" },
-  { value: "dublin", label: "Dublin" },
-  { value: "frankfurt", label: "Frankfurt" },
-  { value: "roaming", label: "Roaming (auto)" },
-] as const;
-
-const schema = z.object({
-  accountSid: z
-    .string()
-    .trim()
-    .regex(/^AC[0-9a-fA-F]{32}$/, "Starts with AC and is 34 chars"),
-  apiKeySid: z
-    .string()
-    .trim()
-    .regex(/^SK[0-9a-fA-F]{32}$/, "Starts with SK and is 34 chars"),
-  apiKeySecret: z.string().trim().min(10, "Required"),
-  twimlAppSid: z
-    .string()
-    .trim()
-    .regex(/^AP[0-9a-fA-F]{32}$/, "Starts with AP and is 34 chars"),
-  authToken: z.string().trim().optional(),
-  fromNumber: z
-    .string()
-    .trim()
-    .regex(/^\+[1-9]\d{6,14}$/, "E.164 only, e.g. +14155552671"),
-  edge: z.string().min(1),
-  recordCalls: z.boolean(),
-  amdEnabled: z.boolean(),
-});
-type Values = z.infer<typeof schema>;
 
 type Summary = {
   configured: boolean;
   accountSidMasked?: string | null;
-  apiKeySidMasked?: string | null;
-  apiKeySecretMasked?: string | null;
-  twimlAppSidMasked?: string | null;
-  authTokenMasked?: string | null;
   fromNumber?: string;
   edge?: string;
   recordCalls?: boolean;
   amdEnabled?: boolean;
   lastTestedAt?: string | null;
   lastTestStatus?: string | null;
+};
+
+type ConnectResponse = {
+  account: {
+    sid: string;
+    friendlyName: string;
+    status: string;
+    type: string;
+  };
+  balance: {
+    amount: string;
+    currency: string;
+  };
+  numbers: Array<{
+    sid: string;
+    phoneNumber: string;
+    friendlyName: string;
+    voiceEnabled: boolean;
+    smsEnabled: boolean;
+  }>;
 };
 
 type TestResult = {
@@ -87,77 +67,140 @@ type TestResult = {
   error?: string;
 };
 
+const credsSchema = z.object({
+  accountSid: z
+    .string()
+    .trim()
+    .regex(/^AC[0-9a-fA-F]{32}$/, "Starts with AC and is 34 chars"),
+  authToken: z.string().trim().min(20, "Paste the Auth Token from Twilio"),
+});
+type CredsValues = z.infer<typeof credsSchema>;
+
 export function TwilioConnectionForm() {
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loadingSummary, setLoadingSummary] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
+
+  const [stage, setStage] = useState<"creds" | "pickNumber" | "done">("creds");
+  const [connectResult, setConnectResult] = useState<ConnectResponse | null>(
+    null,
+  );
+  const [credsCache, setCredsCache] = useState<CredsValues | null>(null);
+  const [selectedNumber, setSelectedNumber] = useState<string | null>(null);
+
+  const [connecting, setConnecting] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [lastTest, setLastTest] = useState<TestResult | null>(null);
+  const [disconnecting, setDisconnecting] = useState(false);
 
-  const form = useForm<Values>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      accountSid: "",
-      apiKeySid: "",
-      apiKeySecret: "",
-      twimlAppSid: "",
-      authToken: "",
-      fromNumber: "",
-      edge: "singapore",
-      recordCalls: true,
-      amdEnabled: true,
-    },
+  const form = useForm<CredsValues>({
+    resolver: zodResolver(credsSchema),
+    defaultValues: { accountSid: "", authToken: "" },
   });
+
+  const isConnected = summary?.configured === true;
+
+  async function refreshSummary() {
+    const res = await authFetch("/api/settings/twilio");
+    if (res.ok) {
+      const body = (await res.json()) as Summary;
+      setSummary(body);
+      if (body.configured) setStage("done");
+    }
+  }
 
   useEffect(() => {
     (async () => {
-      const res = await authFetch("/api/settings/twilio");
-      if (res.ok) {
-        const body = (await res.json()) as Summary;
-        setSummary(body);
-        if (body.configured) {
-          form.reset({
-            accountSid: "",
-            apiKeySid: "",
-            apiKeySecret: "",
-            twimlAppSid: "",
-            authToken: "",
-            fromNumber: body.fromNumber ?? "",
-            edge: body.edge ?? "singapore",
-            recordCalls: body.recordCalls ?? true,
-            amdEnabled: body.amdEnabled ?? true,
-          });
-        }
-      }
+      await refreshSummary();
       setLoadingSummary(false);
     })();
-    // form.reset is stable within react-hook-form
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function onSubmit(values: Values) {
-    setSubmitting(true);
+  // --- Stage 1: enter creds, fetch account + numbers ---
+  async function handleConnect(values: CredsValues) {
+    setConnecting(true);
+    try {
+      const res = await authFetch("/api/twilio/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(values),
+      });
+      const body = (await res.json().catch(() => ({}))) as
+        | ConnectResponse
+        | { error?: string; message?: string };
+      if (!res.ok) {
+        const err = body as { error?: string; message?: string };
+        if (err.error === "invalid_credentials") {
+          toast.error(
+            err.message ??
+              "Invalid Account SID or Auth Token. Copy them again from your Twilio dashboard.",
+          );
+        } else {
+          toast.error(err.message ?? err.error ?? "Connection failed");
+        }
+        return;
+      }
+      const data = body as ConnectResponse;
+      const voiceNumbers = data.numbers.filter((n) => n.voiceEnabled);
+      if (voiceNumbers.length === 0) {
+        toast.error(
+          "No voice-enabled numbers found on this account. Buy a number in the Twilio Console first.",
+        );
+        return;
+      }
+      setConnectResult(data);
+      setCredsCache(values);
+      setSelectedNumber(voiceNumbers[0].phoneNumber);
+      setStage("pickNumber");
+    } catch {
+      toast.error("Network error. Try again.");
+    } finally {
+      setConnecting(false);
+    }
+  }
+
+  // --- Stage 2: pick a number, server auto-provisions API Key + TwiML App ---
+  async function handleFinish() {
+    if (!credsCache || !selectedNumber) return;
+    setSaving(true);
     try {
       const res = await authFetch("/api/settings/twilio", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          ...values,
-          authToken: values.authToken?.trim() || undefined,
+          accountSid: credsCache.accountSid,
+          authToken: credsCache.authToken,
+          fromNumber: selectedNumber,
         }),
       });
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        message?: string;
+      };
       if (!res.ok) {
-        toast.error("Save failed. Check the fields and try again.");
+        if (body.error === "no_public_base_url") {
+          toast.error(
+            body.message ?? "Set a public base URL before saving.",
+          );
+        } else if (body.error === "number_not_voice_enabled") {
+          toast.error("That number doesn't support voice. Pick another one.");
+        } else if (body.error === "number_not_on_account") {
+          toast.error("That number isn't on this account.");
+        } else {
+          toast.error(body.message ?? body.error ?? "Couldn't save.");
+        }
         return;
       }
-      toast.success("Twilio credentials saved");
-      // Refresh masked summary.
-      const s = await authFetch("/api/settings/twilio");
-      if (s.ok) setSummary((await s.json()) as Summary);
+      toast.success("Twilio connected");
+      setCredsCache(null);
+      setConnectResult(null);
+      form.reset();
+      await refreshSummary();
     } catch {
       toast.error("Network error. Try again.");
     } finally {
-      setSubmitting(false);
+      setSaving(false);
     }
   }
 
@@ -172,11 +215,12 @@ export function TwilioConnectionForm() {
       setLastTest(body);
       if (body.ok) {
         toast.success(
-          `Connected: ${body.accountFriendlyName} — ${body.currency} ${body.balance}`,
+          `Connected · ${body.accountFriendlyName} · ${body.currency} ${body.balance}`,
         );
       } else {
         toast.error(`Test failed: ${body.error}`);
       }
+      await refreshSummary();
     } catch {
       toast.error("Test failed: network error");
     } finally {
@@ -184,252 +228,294 @@ export function TwilioConnectionForm() {
     }
   }
 
-  return (
-    <div className="space-y-6">
-      {summary?.configured ? (
-        <Card className="rounded-xl border-border/60 bg-card/60">
-          <CardHeader className="flex-row items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-500/10 text-emerald-500">
-                <ShieldCheck className="h-4 w-4" />
-              </div>
-              <div>
-                <CardTitle>Connected</CardTitle>
-                <CardDescription>
-                  Credentials encrypted at rest with AES-256-GCM.
-                </CardDescription>
-              </div>
+  async function handleDisconnect() {
+    if (
+      !window.confirm(
+        "Disconnect Twilio from this workspace? Stored credentials will be deleted.",
+      )
+    )
+      return;
+    setDisconnecting(true);
+    try {
+      const res = await authFetch("/api/settings/twilio/disconnect", {
+        method: "POST",
+      });
+      if (res.ok) {
+        toast.success("Twilio disconnected");
+        setSummary({ configured: false });
+        setStage("creds");
+        setConnectResult(null);
+        setCredsCache(null);
+        setSelectedNumber(null);
+      } else {
+        toast.error("Couldn't disconnect");
+      }
+    } finally {
+      setDisconnecting(false);
+    }
+  }
+
+  if (loadingSummary) {
+    return (
+      <Card className="rounded-xl border-border/60 bg-card/60">
+        <CardContent className="py-8">
+          <Skeleton className="h-20 w-full" />
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // ----- CONNECTED view -----
+  if (isConnected && stage === "done") {
+    return (
+      <Card className="rounded-xl border-border/60 bg-card/60">
+        <CardHeader className="flex-row items-start justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-500/10 text-emerald-500">
+              <ShieldCheck className="h-4 w-4" />
             </div>
-            <div className="flex items-center gap-2">
-              {summary.lastTestStatus === "ok" ? (
-                <Badge className="bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/20">
-                  <CheckCircle2 className="mr-1 h-3 w-3" /> Last test OK
-                </Badge>
-              ) : summary.lastTestStatus ? (
-                <Badge variant="destructive">
-                  <XCircle className="mr-1 h-3 w-3" /> {summary.lastTestStatus}
-                </Badge>
-              ) : null}
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleTest}
-                disabled={testing}
-              >
-                {testing ? (
-                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Wifi className="mr-2 h-3.5 w-3.5" />
-                )}
-                Test connection
-              </Button>
+            <div>
+              <CardTitle>Twilio connected</CardTitle>
+              <CardDescription>
+                Your credentials are encrypted at rest with AES-256-GCM.
+              </CardDescription>
             </div>
-          </CardHeader>
-          <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
-            <Field label="Account SID" value={summary.accountSidMasked} />
-            <Field label="API Key SID" value={summary.apiKeySidMasked} />
-            <Field label="API Key Secret" value={summary.apiKeySecretMasked} />
-            <Field label="TwiML App SID" value={summary.twimlAppSidMasked} />
-            <Field label="Auth Token" value={summary.authTokenMasked ?? "—"} />
-            <Field label="From Number" value={summary.fromNumber} />
-            <Field label="Edge" value={summary.edge} />
+          </div>
+          <div className="flex items-center gap-2">
+            {summary?.lastTestStatus === "ok" ? (
+              <Badge className="bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/20">
+                <CheckCircle2 className="mr-1 h-3 w-3" /> Last test OK
+              </Badge>
+            ) : summary?.lastTestStatus ? (
+              <Badge variant="destructive">
+                <XCircle className="mr-1 h-3 w-3" /> Failed
+              </Badge>
+            ) : null}
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="From number" value={summary?.fromNumber ?? "—"} mono />
+            <Field label="Account SID" value={summary?.accountSidMasked ?? "—"} mono />
             {lastTest?.ok ? (
               <Field
                 label="Balance"
                 value={`${lastTest.currency} ${lastTest.balance}`}
               />
             ) : null}
-          </CardContent>
-        </Card>
-      ) : null}
+          </div>
 
-      <Card className="rounded-xl border-border/60 bg-card/60">
-        <CardHeader>
-          <CardTitle>
-            {summary?.configured ? "Replace credentials" : "Connect Twilio"}
-          </CardTitle>
-          <CardDescription>
-            You can rotate any SID/Secret here. Existing values remain in use
-            until you save.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form
-            onSubmit={form.handleSubmit(onSubmit)}
-            className="grid gap-4 sm:grid-cols-2"
-          >
-            <div className="space-y-1.5 sm:col-span-2">
-              <Label htmlFor="accountSid">Account SID</Label>
-              <Input
-                id="accountSid"
-                placeholder="AC..."
-                autoComplete="off"
-                {...form.register("accountSid")}
-              />
-              {form.formState.errors.accountSid ? (
-                <p className="text-xs text-destructive">
-                  {form.formState.errors.accountSid.message}
-                </p>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleTest}
+              disabled={testing}
+            >
+              {testing ? (
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Wifi className="mr-2 h-3.5 w-3.5" />
+              )}
+              Test connection
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={handleDisconnect}
+              disabled={disconnecting}
+            >
+              {disconnecting ? (
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
               ) : null}
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="apiKeySid">API Key SID</Label>
-              <Input
-                id="apiKeySid"
-                placeholder="SK..."
-                autoComplete="off"
-                {...form.register("apiKeySid")}
-              />
-              {form.formState.errors.apiKeySid ? (
-                <p className="text-xs text-destructive">
-                  {form.formState.errors.apiKeySid.message}
-                </p>
-              ) : null}
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="apiKeySecret">API Key Secret</Label>
-              <Input
-                id="apiKeySecret"
-                type="password"
-                placeholder="••••••••"
-                autoComplete="off"
-                {...form.register("apiKeySecret")}
-              />
-              {form.formState.errors.apiKeySecret ? (
-                <p className="text-xs text-destructive">
-                  {form.formState.errors.apiKeySecret.message}
-                </p>
-              ) : null}
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="twimlAppSid">TwiML App SID</Label>
-              <Input
-                id="twimlAppSid"
-                placeholder="AP..."
-                autoComplete="off"
-                {...form.register("twimlAppSid")}
-              />
-              {form.formState.errors.twimlAppSid ? (
-                <p className="text-xs text-destructive">
-                  {form.formState.errors.twimlAppSid.message}
-                </p>
-              ) : null}
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="fromNumber">From number (E.164)</Label>
-              <Input
-                id="fromNumber"
-                placeholder="+14155552671"
-                autoComplete="off"
-                {...form.register("fromNumber")}
-              />
-              {form.formState.errors.fromNumber ? (
-                <p className="text-xs text-destructive">
-                  {form.formState.errors.fromNumber.message}
-                </p>
-              ) : null}
-            </div>
-
-            <div className="space-y-1.5 sm:col-span-2">
-              <Label htmlFor="authToken">
-                Auth Token{" "}
-                <span className="text-xs font-normal text-muted-foreground">
-                  (optional — only needed to validate Twilio webhook signatures)
-                </span>
-              </Label>
-              <Input
-                id="authToken"
-                type="password"
-                placeholder="••••••••"
-                autoComplete="off"
-                {...form.register("authToken")}
-              />
-            </div>
-
-            <Separator className="sm:col-span-2" />
-
-            <div className="space-y-1.5">
-              <Label>Edge location</Label>
-              <Select
-                value={form.watch("edge")}
-                onValueChange={(v) => form.setValue("edge", v)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {EDGE_OPTIONS.map((e) => (
-                    <SelectItem key={e.value} value={e.value}>
-                      {e.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="flex items-center justify-between rounded-lg border border-border/60 p-3">
-                <div>
-                  <Label className="text-sm">Record calls</Label>
-                  <p className="text-xs text-muted-foreground">record-from-answer</p>
-                </div>
-                <Switch
-                  checked={form.watch("recordCalls")}
-                  onCheckedChange={(v) => form.setValue("recordCalls", v)}
-                />
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/60 p-3">
-                <div>
-                  <Label className="text-sm">AMD (voicemail detect)</Label>
-                  <p className="text-xs text-muted-foreground">DetectMessageEnd</p>
-                </div>
-                <Switch
-                  checked={form.watch("amdEnabled")}
-                  onCheckedChange={(v) => form.setValue("amdEnabled", v)}
-                />
-              </div>
-            </div>
-
-            <div className="sm:col-span-2 flex items-center justify-end gap-2 pt-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={handleTest}
-                disabled={!summary?.configured || testing}
-              >
-                {testing ? (
-                  <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Wifi className="mr-2 h-3.5 w-3.5" />
-                )}
-                Test connection
-              </Button>
-              <Button type="submit" disabled={submitting || loadingSummary}>
-                {submitting ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : null}
-                Save credentials
-              </Button>
-            </div>
-          </form>
+              Disconnect
+            </Button>
+          </div>
         </CardContent>
       </Card>
-    </div>
+    );
+  }
+
+  // ----- PICK NUMBER view -----
+  if (stage === "pickNumber" && connectResult) {
+    const voiceNumbers = connectResult.numbers.filter((n) => n.voiceEnabled);
+    return (
+      <Card className="rounded-xl border-border/60 bg-card/60">
+        <CardHeader>
+          <CardTitle>Pick a number to call from</CardTitle>
+          <CardDescription>
+            Connected to{" "}
+            <span className="font-medium text-foreground">
+              {connectResult.account.friendlyName}
+            </span>
+            {" · "}
+            Balance {connectResult.balance.currency} {connectResult.balance.amount}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="divide-y divide-border/60 rounded-lg border border-border/60">
+            {voiceNumbers.map((n) => {
+              const selected = selectedNumber === n.phoneNumber;
+              return (
+                <button
+                  key={n.sid}
+                  type="button"
+                  onClick={() => setSelectedNumber(n.phoneNumber)}
+                  className={`flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors ${
+                    selected ? "bg-primary/5" : "hover:bg-card"
+                  }`}
+                >
+                  <div>
+                    <div className="font-mono text-sm">{n.phoneNumber}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {n.friendlyName}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {n.smsEnabled ? (
+                      <Badge variant="secondary" className="text-[10px]">
+                        SMS
+                      </Badge>
+                    ) : null}
+                    <Badge variant="secondary" className="text-[10px]">
+                      Voice
+                    </Badge>
+                    {selected ? (
+                      <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                    ) : null}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center justify-between gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setStage("creds");
+                setConnectResult(null);
+                setSelectedNumber(null);
+              }}
+            >
+              Back
+            </Button>
+            <Button
+              onClick={handleFinish}
+              disabled={saving || !selectedNumber}
+            >
+              {saving ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : null}
+              Finish setup
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // ----- CREDS entry view -----
+  return (
+    <Card className="rounded-xl border-border/60 bg-card/60">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Plug className="h-4 w-4" /> Connect your Twilio
+        </CardTitle>
+        <CardDescription>
+          Grab your Account SID and Auth Token from the{" "}
+          <a
+            href="https://console.twilio.com/"
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-4"
+          >
+            Twilio Console
+          </a>
+          . We'll discover your numbers and set up the rest.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <form
+          onSubmit={form.handleSubmit(handleConnect)}
+          className="grid gap-3 sm:grid-cols-2"
+        >
+          <div className="space-y-1.5 sm:col-span-2">
+            <Label htmlFor="accountSid">Account SID</Label>
+            <Input
+              id="accountSid"
+              placeholder="AC…"
+              autoComplete="off"
+              className="font-mono"
+              {...form.register("accountSid")}
+            />
+            {form.formState.errors.accountSid ? (
+              <p className="text-xs text-destructive">
+                {form.formState.errors.accountSid.message}
+              </p>
+            ) : null}
+          </div>
+          <div className="space-y-1.5 sm:col-span-2">
+            <Label htmlFor="authToken">Auth Token</Label>
+            <Input
+              id="authToken"
+              type="password"
+              placeholder="••••••••"
+              autoComplete="off"
+              className="font-mono"
+              {...form.register("authToken")}
+            />
+            {form.formState.errors.authToken ? (
+              <p className="text-xs text-destructive">
+                {form.formState.errors.authToken.message}
+              </p>
+            ) : null}
+          </div>
+
+          <div className="sm:col-span-2 flex items-center justify-end">
+            <Button type="submit" disabled={connecting}>
+              {connecting ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : null}
+              Connect
+            </Button>
+          </div>
+        </form>
+
+        <Alert className="border-border/60 bg-background/40">
+          <Plug className="h-4 w-4" />
+          <AlertTitle>What happens next</AlertTitle>
+          <AlertDescription className="text-xs text-muted-foreground">
+            We validate your credentials, show your voice-enabled numbers, and
+            auto-provision an API Key &amp; TwiML App named "Dialer by LaunchCraft"
+            on your Twilio account. Everything is encrypted at rest.
+          </AlertDescription>
+        </Alert>
+      </CardContent>
+    </Card>
   );
 }
 
 function Field({
   label,
   value,
+  mono,
 }: {
   label: string;
-  value: string | null | undefined;
+  value: string;
+  mono?: boolean;
 }) {
   return (
     <div className="rounded-lg border border-border/60 p-3">
       <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
         {label}
       </div>
-      <div className="mt-0.5 font-mono text-sm">{value ?? "—"}</div>
+      <div
+        className={`mt-0.5 text-sm ${mono ? "font-mono" : "font-medium"}`}
+      >
+        {value}
+      </div>
     </div>
   );
 }
