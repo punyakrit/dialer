@@ -4,9 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   CheckCircle2,
+  DownloadCloud,
   Loader2,
   Plug,
   ShieldCheck,
@@ -76,7 +78,76 @@ const credsSchema = z.object({
 });
 type CredsValues = z.infer<typeof credsSchema>;
 
+type SyncResponse = {
+  imported: number;
+  hasMore: boolean;
+  cursor: string | null;
+};
+
+/**
+ * Fire-and-forget backfill of past Twilio calls. Re-invokes `/api/twilio/sync`
+ * with a date cursor until the history is exhausted. Updates a single toast
+ * so the user sees live progress without getting spammed.
+ */
+async function runHistorySync(
+  queryClient: ReturnType<typeof useQueryClient>,
+): Promise<void> {
+  const TOAST = "twilio-sync";
+  let total = 0;
+  let cursor: string | null = null;
+  let pages = 0;
+
+  toast.loading("Importing your past calls from Twilio…", { id: TOAST });
+
+  try {
+    // Hard cap on pages to avoid runaway loops on giant accounts.
+    const MAX_PAGES = 20;
+
+    while (pages < MAX_PAGES) {
+      const params = new URLSearchParams();
+      if (cursor) params.set("cursor", cursor);
+      const res = await authFetch(
+        `/api/twilio/sync${params.toString() ? `?${params}` : ""}`,
+        { method: "POST" },
+      );
+      if (!res.ok) break;
+      const body = (await res.json()) as SyncResponse;
+      total += body.imported;
+      pages++;
+
+      toast.loading(
+        total === 0
+          ? "Importing your past calls from Twilio…"
+          : `Imported ${total.toLocaleString()} calls…`,
+        { id: TOAST },
+      );
+
+      if (!body.hasMore || !body.cursor) break;
+      cursor = body.cursor;
+    }
+
+    if (total > 0) {
+      toast.success(
+        `Imported ${total.toLocaleString()} past call${total === 1 ? "" : "s"}`,
+        { id: TOAST },
+      );
+    } else {
+      toast.dismiss(TOAST);
+    }
+
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["calls"] }),
+      queryClient.invalidateQueries({ queryKey: ["kpis"] }),
+      queryClient.invalidateQueries({ queryKey: ["series"] }),
+    ]);
+  } catch {
+    toast.dismiss(TOAST);
+  }
+}
+
 export function TwilioConnectionForm() {
+  const queryClient = useQueryClient();
+
   const [summary, setSummary] = useState<Summary | null>(null);
   const [loadingSummary, setLoadingSummary] = useState(true);
 
@@ -92,6 +163,7 @@ export function TwilioConnectionForm() {
   const [testing, setTesting] = useState(false);
   const [lastTest, setLastTest] = useState<TestResult | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [resyncing, setResyncing] = useState(false);
 
   const form = useForm<CredsValues>({
     resolver: zodResolver(credsSchema),
@@ -197,6 +269,11 @@ export function TwilioConnectionForm() {
       setConnectResult(null);
       form.reset();
       await refreshSummary();
+      await queryClient.invalidateQueries({ queryKey: ["twilio-balance"] });
+
+      // Fire a background sync of past calls — non-blocking. Runs until the
+      // Twilio account is fully paged in, showing progress via a toast.
+      void runHistorySync(queryClient);
     } catch {
       toast.error("Network error. Try again.");
     } finally {
@@ -228,6 +305,16 @@ export function TwilioConnectionForm() {
     }
   }
 
+  async function handleResync() {
+    if (resyncing) return;
+    setResyncing(true);
+    try {
+      await runHistorySync(queryClient);
+    } finally {
+      setResyncing(false);
+    }
+  }
+
   async function handleDisconnect() {
     if (
       !window.confirm(
@@ -247,6 +334,7 @@ export function TwilioConnectionForm() {
         setConnectResult(null);
         setCredsCache(null);
         setSelectedNumber(null);
+        await queryClient.invalidateQueries({ queryKey: ["twilio-balance"] });
       } else {
         toast.error("Couldn't disconnect");
       }
@@ -305,7 +393,7 @@ export function TwilioConnectionForm() {
             ) : null}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               size="sm"
               variant="outline"
@@ -321,9 +409,24 @@ export function TwilioConnectionForm() {
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={handleResync}
+              disabled={resyncing}
+              title="Pull recent Twilio calls into this workspace"
+            >
+              {resyncing ? (
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <DownloadCloud className="mr-2 h-3.5 w-3.5" />
+              )}
+              {resyncing ? "Syncing…" : "Resync history"}
+            </Button>
+            <Button
+              size="sm"
               variant="ghost"
               onClick={handleDisconnect}
               disabled={disconnecting}
+              className="ml-auto"
             >
               {disconnecting ? (
                 <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
