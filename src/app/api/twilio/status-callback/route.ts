@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { verifyTwilioWebhook } from "@/lib/twilio/webhook-verify";
-import { upsertByTwilioSid } from "@/server/repositories/calls.repo";
+import { updateCallStatusByTwilioSid } from "@/server/repositories/calls.repo";
 import type { CallStatus } from "@/types/db";
 import { logger } from "@/lib/logger";
 
@@ -26,8 +26,14 @@ export async function POST(req: NextRequest) {
   }
 
   const p = verified.params;
+  // The `<Number statusCallback>` webhook fires for the dialed (child) leg —
+  // its CallSid is the child SID, while ParentCallSid is the client leg that
+  // `/api/twilio/voice/outbound` seeded a row for. Match the seeded row via
+  // ParentCallSid when present; fall back to CallSid for parent-leg events.
   const callSid = p.CallSid;
-  if (!callSid) {
+  const parentCallSid = p.ParentCallSid;
+  const rowSid = parentCallSid || callSid;
+  if (!rowSid) {
     return NextResponse.json({ error: "missing_call_sid" }, { status: 400 });
   }
 
@@ -47,42 +53,63 @@ export async function POST(req: NextRequest) {
     twilioStatus === "canceled"
       ? nowIso
       : null;
-  const durationSec = p.CallDuration
+  const parsedDuration = p.CallDuration
     ? Number.parseInt(p.CallDuration, 10)
     : p.Duration
       ? Number.parseInt(p.Duration, 10)
       : null;
+  const durationSec = parsedDuration !== null && Number.isFinite(parsedDuration)
+    ? parsedDuration
+    : null;
 
   try {
-    await upsertByTwilioSid(
+    const row = await updateCallStatusByTwilioSid(
       verified.workspaceId,
-      callSid,
-      {
-        // We don't know user_id here — upsert only populates if new row.
-        // Trust that the `/api/twilio/voice/outbound` flow (or future create)
-        // seeded the row; if not, the columns stay NULL until we match them
-        // later via another webhook event.
-        from: p.From,
-        to: p.To,
-      },
+      rowSid,
       {
         status,
         startedAt,
         answeredAt,
         endedAt,
-        durationSec: Number.isFinite(durationSec) ? (durationSec ?? null) : null,
+        durationSec,
         priceUsd: p.Price ?? null,
         errorCode: p.ErrorCode ?? null,
         errorMessage: p.ErrorMessage ?? null,
       },
     );
+    if (!row) {
+      logger.warn("status-callback: no row matched rowSid", {
+        rowSid,
+        callSid,
+        parentCallSid,
+        twilioStatus,
+      });
+    }
   } catch (err) {
-    logger.error("status-callback upsert failed", {
-      err: err instanceof Error ? err.message : "unknown",
+    logger.error("status-callback update failed", {
+      err: describeError(err),
+      rowSid,
       callSid,
+      parentCallSid,
+      twilioStatus,
     });
-    return NextResponse.json({ error: "internal" }, { status: 500 });
+    // Return 200 so Twilio doesn't retry the same failing webhook repeatedly.
+    return NextResponse.json({ ok: false });
   }
 
   return NextResponse.json({ ok: true });
+}
+
+function describeError(err: unknown): Record<string, unknown> | string {
+  if (err instanceof Error) return { message: err.message, name: err.name };
+  if (err && typeof err === "object") {
+    const o = err as Record<string, unknown>;
+    return {
+      message: typeof o.message === "string" ? o.message : undefined,
+      code: o.code,
+      details: o.details,
+      hint: o.hint,
+    };
+  }
+  return String(err);
 }

@@ -4,6 +4,9 @@ import { outboundTwiml } from "@/lib/twilio/twiml";
 import { verifyTwilioWebhook } from "@/lib/twilio/webhook-verify";
 import { serverEnv, clientEnv } from "@/lib/env";
 import { logger } from "@/lib/logger";
+import { seedOutboundCall } from "@/server/repositories/calls.repo";
+
+const CLIENT_IDENTITY_PREFIX = "client:user-";
 
 export const runtime = "nodejs";
 
@@ -46,7 +49,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 
-  const to = verified.params.To ?? verified.params.to;
+  const p = verified.params;
+  const to = p.To ?? p.to;
   if (!to) {
     return new NextResponse(
       '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Missing destination number.</Say></Response>',
@@ -73,6 +77,41 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Seed the calls row BEFORE returning TwiML. `calls.user_id` is NOT NULL,
+  // and the `<Number statusCallback>` webhook never sees a user_id — so if we
+  // skip this, the child-leg status-callback will try to INSERT and fail with
+  // a Postgres NOT NULL violation (surfacing as `err: "unknown"` because
+  // PostgrestError isn't `instanceof Error`).
+  const callSid = p.CallSid;
+  const fromRaw = p.From ?? "";
+  const userId = fromRaw.startsWith(CLIENT_IDENTITY_PREFIX)
+    ? fromRaw.slice(CLIENT_IDENTITY_PREFIX.length)
+    : null;
+  const leadId = p.LeadId ?? null;
+
+  if (callSid && userId) {
+    try {
+      await seedOutboundCall(verified.workspaceId, {
+        userId,
+        twilioCallSid: callSid,
+        from: cfg.fromNumber,
+        to,
+        leadId,
+      });
+    } catch (err) {
+      logger.error("outbound: seed call row failed", {
+        err: describeError(err),
+        callSid,
+        workspaceId: verified.workspaceId,
+      });
+    }
+  } else {
+    logger.warn("outbound: missing callSid or user identity for seed", {
+      hasCallSid: !!callSid,
+      from: fromRaw,
+    });
+  }
+
   const xml = outboundTwiml({
     to,
     config: cfg,
@@ -84,4 +123,18 @@ export async function POST(req: NextRequest) {
     status: 200,
     headers: { "content-type": "text/xml" },
   });
+}
+
+function describeError(err: unknown): Record<string, unknown> | string {
+  if (err instanceof Error) return { message: err.message, name: err.name };
+  if (err && typeof err === "object") {
+    const o = err as Record<string, unknown>;
+    return {
+      message: typeof o.message === "string" ? o.message : undefined,
+      code: o.code,
+      details: o.details,
+      hint: o.hint,
+    };
+  }
+  return String(err);
 }

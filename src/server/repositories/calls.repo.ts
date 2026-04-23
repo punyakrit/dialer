@@ -1,6 +1,8 @@
 import "server-only";
 import { supabaseAdmin } from "@/lib/supabase/admin";
-import type { CallRow, CallStatus, Disposition } from "@/types/db";
+import type { CallRow, CallStatus, Database, Disposition } from "@/types/db";
+
+type CallUpdate = Database["dialer"]["Tables"]["calls"]["Update"];
 
 export type CallFilters = {
   dispositionIn?: Disposition[] | null;
@@ -127,6 +129,78 @@ export async function upsertByTwilioSid(
     .single();
   if (error) throw error;
   return data as CallRow;
+}
+
+export type SeedOutboundCallInput = {
+  userId: string;
+  twilioCallSid: string;       // parent-leg SID from the TwiML voice webhook
+  from: string;                // caller ID (the Twilio DID), not "client:user-…"
+  to: string;                  // dialed E.164
+  leadId?: string | null;
+};
+
+/**
+ * Seed a minimal row at dial time so status-callbacks have something to update.
+ * Required because `calls.user_id` is NOT NULL — the status-callback webhook
+ * never has the user_id, so it cannot create the row itself.
+ *
+ * Idempotent: a duplicate twilio_call_sid is a no-op.
+ */
+export async function seedOutboundCall(
+  workspaceId: string,
+  input: SeedOutboundCallInput,
+): Promise<void> {
+  const { error } = await supabaseAdmin()
+    .from("calls")
+    .upsert(
+      {
+        workspace_id: workspaceId,
+        user_id: input.userId,
+        twilio_call_sid: input.twilioCallSid,
+        from: input.from,
+        to: input.to,
+        lead_id: input.leadId ?? null,
+        direction: "OUTBOUND",
+        status: "INITIATED",
+      },
+      { onConflict: "twilio_call_sid", ignoreDuplicates: true },
+    );
+  if (error) throw error;
+}
+
+/**
+ * Status-callback writer: patches an existing row by `twilio_call_sid`.
+ * Never creates a row — if the seed is missing, returns null so the caller
+ * can log a warning without erroring the webhook.
+ */
+export async function updateCallStatusByTwilioSid(
+  workspaceId: string,
+  twilioCallSid: string,
+  patch: StatusCallbackPatch,
+): Promise<CallRow | null> {
+  const update: CallUpdate = {};
+  if (patch.status !== undefined) update.status = patch.status;
+  if (patch.startedAt) update.started_at = patch.startedAt;
+  if (patch.answeredAt) update.answered_at = patch.answeredAt;
+  if (patch.endedAt) update.ended_at = patch.endedAt;
+  if (patch.durationSec != null) update.duration_sec = patch.durationSec;
+  if (patch.priceUsd != null) update.price_usd = patch.priceUsd;
+  if (patch.errorCode != null) update.error_code = patch.errorCode;
+  if (patch.errorMessage != null) update.error_message = patch.errorMessage;
+
+  if (Object.keys(update).length === 0) {
+    return null;
+  }
+
+  const { data, error } = await supabaseAdmin()
+    .from("calls")
+    .update(update)
+    .eq("workspace_id", workspaceId)
+    .eq("twilio_call_sid", twilioCallSid)
+    .select("*")
+    .maybeSingle();
+  if (error) throw error;
+  return data as CallRow | null;
 }
 
 export async function setRecording(
